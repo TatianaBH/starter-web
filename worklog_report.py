@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, base64, calendar, requests
+import os, sys, base64, calendar, time, requests
 from collections import defaultdict
 from datetime import datetime
 
@@ -36,36 +36,58 @@ print(f"# Worklog report — {datetime.strptime(START, '%Y-%m-%d').strftime('%B 
 auth = base64.b64encode(f'{os.environ["JIRA_EMAIL"]}:{os.environ["JIRA_API_TOKEN"]}'.encode()).decode()
 H = {"Authorization": f"Basic {auth}", "Accept": "application/json"}
 
-# 1) issues that have worklogs in the range (paginated)
-jql = f'project = CM AND worklogDate >= "{START}" AND worklogDate <= "{END}"'
-keys, token = [], None
-while True:
-    p = {"jql": jql, "fields": "summary", "maxResults": 100}
-    if token: p["nextPageToken"] = token
-    d = requests.get(f"{BASE}/rest/api/3/search/jql", headers=H, params=p).json()
-    keys += [(i["key"], i["fields"]["summary"]) for i in d.get("issues", [])]
-    token = d.get("nextPageToken")
-    if not token: break
-
 def comment(c):
     if not c: return ""
     return " ".join(t["text"] for b in c.get("content", [])
                     for t in b.get("content", []) if t.get("type") == "text")
 
-# 2) ALL worklogs per issue (paginated), filtered to range
+# --- Real-time worklog collection (no search-index lag) -------------------
+# Instead of asking the (laggy) search index "which issues have worklogs?",
+# we read worklogs straight from Jira's real-time worklog endpoints. This
+# guarantees freshly-added and backdated entries show up immediately.
+
+def epoch_ms(date_str):
+    return int(time.mktime(time.strptime(date_str, "%Y-%m-%d")) * 1000)
+
+# 1) IDs of all worklogs updated since well before the target month
+#    (180-day buffer covers backdated / late-edited entries), paginated.
+since = epoch_ms(START) - 180 * 86400 * 1000
+worklog_ids = []
+while True:
+    u = requests.get(f"{BASE}/rest/api/3/worklog/updated",
+                     headers=H, params={"since": since}).json()
+    worklog_ids += [v["worklogId"] for v in u.get("values", [])]
+    if u.get("lastPage", True): break
+    since = u["until"]
+
+# 2) Fetch worklog details in batches, keep only those started in the range.
+in_range = []
+for i in range(0, len(worklog_ids), 1000):
+    det = requests.post(f"{BASE}/rest/api/3/worklog/list",
+                        headers={**H, "Content-Type": "application/json"},
+                        json={"ids": worklog_ids[i:i + 1000]}).json()
+    in_range += [w for w in det if START <= w["started"][:10] <= END]
+
+# 3) Map issueId -> (key, summary) for project CM only (worklog details
+#    carry just the issueId, so we resolve keys/summaries in batches).
+meta = {}
+issue_ids = sorted({str(w["issueId"]) for w in in_range})
+for i in range(0, len(issue_ids), 100):
+    chunk = issue_ids[i:i + 100]
+    jql = f'id in ({",".join(chunk)}) AND project = CM'
+    d = requests.get(f"{BASE}/rest/api/3/search/jql", headers=H,
+                     params={"jql": jql, "fields": "summary", "maxResults": 100}).json()
+    for it in d.get("issues", []):
+        meta[it["id"]] = (it["key"], it["fields"]["summary"])
+
+# 4) Aggregate by person -> day (skipping any worklog not in project CM).
 agg = defaultdict(lambda: defaultdict(list))
-for key, summ in keys:
-    start = 0
-    while True:
-        d = requests.get(f"{BASE}/rest/api/3/issue/{key}/worklog",
-                         headers=H, params={"startAt": start, "maxResults": 100}).json()
-        for w in d.get("worklogs", []):
-            day = w["started"][:10]
-            if START <= day <= END:
-                agg[w["author"]["displayName"]][day].append(
-                    (key, summ, w["timeSpentSeconds"], comment(w.get("comment"))))
-        start += d.get("maxResults", 100)
-        if start >= d.get("total", 0): break
+for w in in_range:
+    iid = str(w["issueId"])
+    if iid not in meta: continue
+    key, summ = meta[iid]
+    agg[w["author"]["displayName"]][w["started"][:10]].append(
+        (key, summ, w["timeSpentSeconds"], comment(w.get("comment"))))
 
 # 3) format (hours/minutes only; no empty-description flags; only days with work)
 def fmt(s):
